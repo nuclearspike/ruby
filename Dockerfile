@@ -2,6 +2,7 @@
 # (find_time_t offset seed + probe dedup; see nuclearspike/ruby tag v3_3_10-timelocal.1).
 # Built for the heroku-26 stack; consumed by app Dockerfiles as their runtime interpreter.
 FROM heroku/heroku:26-build AS build
+USER root
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq && apt-get install -y -qq autoconf rustc libssl-dev libyaml-dev zlib1g-dev libgmp-dev libffi-dev libreadline-dev git && rm -rf /var/lib/apt/lists/*
 RUN git clone --depth 1 --branch v3_3_10-timelocal.1 https://github.com/nuclearspike/ruby.git /ruby-src
