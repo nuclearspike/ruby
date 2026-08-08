@@ -700,6 +700,16 @@ static int leap_year_p(long y);
 static VALUE tm_from_time(VALUE klass, VALUE time);
 
 bool ruby_tz_uptodate_p;
+static unsigned int ruby_tz_generation;
+
+/* Last observed local-time offset (guess0 - t) used to seed find_time_t's
+ * first probe. Every use is probe-verified against localtime_r, so a stale
+ * (or torn) value can only cost extra probes, never a wrong result. */
+static struct {
+    time_t off;
+    unsigned int gen;
+    int valid;
+} find_time_seed;
 
 #ifdef _WIN32
 enum {tzkey_max = numberof(((DYNAMIC_TIME_ZONE_INFORMATION *)NULL)->TimeZoneKeyName)};
@@ -743,6 +753,7 @@ void
 ruby_reset_timezone(const char *val)
 {
     ruby_tz_uptodate_p = false;
+    ruby_tz_generation++;
 #ifdef _WIN32
     w32_tz.use_tzkey = !val || !*val;
 #endif
@@ -760,7 +771,12 @@ update_tz(void)
 static struct tm *
 rb_localtime_r(const time_t *t, struct tm *result)
 {
-#if defined __APPLE__ && defined __LP64__
+#if defined __APPLE__ && defined __LP64__ && !defined __arm64__
+    /* Workaround for the 2010-era x86_64-darwin localtime() infinite-loop
+     * bug (fadc3a8bbc, [ruby-core:30031]). The arm64 Darwin libc never
+     * shipped that bug and handles the full 64-bit range correctly, so
+     * keep exact conversions there instead of falling back to guessed
+     * offsets for out-of-int32 times. */
     if (*t != (time_t)(int)*t) return NULL;
 #endif
     update_tz();
@@ -3328,6 +3344,8 @@ find_time_t(struct tm *tptr, int utc_p, time_t *tp)
     struct tm result;
     int status;
     int tptr_tm_yday;
+    struct tm tm_lo_cache, tm_hi_cache;
+    int have_tm_lo = 0, have_tm_hi = 0;
 
 #define GUESS(p) (DEBUG_FIND_TIME_NUMGUESS_INC (utc_p ? gmtime_with_leapsecond((p), &result) : LOCALTIME((p), result)))
 
@@ -3393,39 +3411,72 @@ find_time_t(struct tm *tptr, int utc_p, time_t *tp)
 
     DEBUG_REPORT_GUESSRANGE;
     guess0 = guess = timegm_noleapsecond(&tm0);
+    if (!utc_p && find_time_seed.valid &&
+        find_time_seed.gen == ruby_tz_generation &&
+        TIMET_MIN + 2 * 24 * 60 * 60 < guess0 &&
+        guess0 < TIMET_MAX - 2 * 24 * 60 * 60) {
+        /* Seed the first probe with the last observed local offset. This
+         * only changes WHICH points get probed: a hit is compared exactly
+         * like any other guess and still passes through the nonmonotonic
+         * (DST) disambiguation in the found-path; a miss just brackets the
+         * search from a different starting point. */
+        guess = guess0 - find_time_seed.off;
+    }
     tm = GUESS(&guess);
     if (tm) {
         d = tmcmp(tptr, tm);
         if (d == 0) { goto found; }
         if (d < 0) {
             guess_hi = guess;
+            tm_hi_cache = *tm;
+            have_tm_hi = 1;
             guess -= 24 * 60 * 60;
         }
         else {
             guess_lo = guess;
+            tm_lo_cache = *tm;
+            have_tm_lo = 1;
             guess += 24 * 60 * 60;
         }
         DEBUG_REPORT_GUESSRANGE;
         if (guess_lo < guess && guess < guess_hi && (tm = GUESS(&guess)) != NULL) {
             d = tmcmp(tptr, tm);
             if (d == 0) { goto found; }
-            if (d < 0)
+            if (d < 0) {
                 guess_hi = guess;
-            else
+                tm_hi_cache = *tm;
+                have_tm_hi = 1;
+            }
+            else {
                 guess_lo = guess;
+                tm_lo_cache = *tm;
+                have_tm_lo = 1;
+            }
             DEBUG_REPORT_GUESSRANGE;
         }
     }
 
-    tm = GUESS(&guess_lo);
-    if (!tm) goto error;
+    if (have_tm_lo) {
+        /* guess_lo was set from a probe above; reuse its result instead of
+         * calling localtime again for the same time_t (deterministic). */
+        tm = &tm_lo_cache;
+    }
+    else {
+        tm = GUESS(&guess_lo);
+        if (!tm) goto error;
+    }
     d = tmcmp(tptr, tm);
     if (d < 0) goto out_of_range;
     if (d == 0) { guess = guess_lo; goto found; }
     tm_lo = *tm;
 
-    tm = GUESS(&guess_hi);
-    if (!tm) goto error;
+    if (have_tm_hi) {
+        tm = &tm_hi_cache;
+    }
+    else {
+        tm = GUESS(&guess_hi);
+        if (!tm) goto error;
+    }
     d = tmcmp(tptr, tm);
     if (d > 0) goto out_of_range;
     if (d == 0) { guess = guess_hi; goto found; }
@@ -3546,7 +3597,7 @@ find_time_t(struct tm *tptr, int utc_p, time_t *tp)
                                 *tp = guess;
                             else
                                 *tp = guess2;
-                            return NULL;
+                            goto remember;
                         }
                     }
                 }
@@ -3571,7 +3622,7 @@ find_time_t(struct tm *tptr, int utc_p, time_t *tp)
                                 *tp = guess2;
                             else
                                 *tp = guess;
-                            return NULL;
+                            goto remember;
                         }
                     }
                 }
@@ -3579,6 +3630,13 @@ find_time_t(struct tm *tptr, int utc_p, time_t *tp)
         }
     }
     *tp = guess;
+
+  remember:
+    if (!utc_p) {
+        find_time_seed.off = guess0 - *tp;
+        find_time_seed.gen = ruby_tz_generation;
+        find_time_seed.valid = 1;
+    }
     return NULL;
 
   out_of_range:
