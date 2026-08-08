@@ -26,22 +26,18 @@ jobs:
             ghcr.io/nuclearspike/ruby-timelocal:3.3.10-timelocal.1
             ghcr.io/nuclearspike/ruby-timelocal:3.3.10
 
-      # Native amd64 differential: every timezone on the runner's tzdata,
-      # patched interpreter vs the official stock 3.3.10 image. Any difference
-      # in epoch seconds, UTC offset, DST flag or zone abbreviation fails the
-      # build. (This is the amd64 leg of the same check run on macOS arm64 and
-      # Linux aarch64 — emulated amd64 cannot run it: qemu's tar returns ENOSYS.)
-      - name: Timezone parity vs stock ruby 3.3.10 (native amd64)
-        run: |
-          docker pull -q ghcr.io/nuclearspike/ruby-timelocal:3.3.10-timelocal.1
-          docker pull -q ruby:3.3.10
-          docker run --rm -v "$PWD:/h:ro" ruby:3.3.10 \
-            ruby --disable-gems /h/parity_all_zones.rb > stock.txt 2> stock.err
-          docker run --rm -v "$PWD:/h:ro" ghcr.io/nuclearspike/ruby-timelocal:3.3.10-timelocal.1 \
-            ruby --disable-gems /h/parity_all_zones.rb > patched.txt 2> patched.err
-          echo "zones compared: $(wc -l < stock.txt) ($(cat stock.err))"
-          if diff -q stock.txt patched.txt > /dev/null; then
-            echo "PARITY OK — all zones byte-identical on x86_64-linux"
-          else
-            echo "PARITY FAILURE:"; diff stock.txt patched.txt | head -40; exit 1
-          fi
+      # Native amd64 timezone differential, tzdata and libc held constant:
+      # stock v3_3_10 and the patched tag are both built inside one image and
+      # compared there. Any difference in epoch seconds, UTC offset, DST flag
+      # or zone abbreviation fails the build. This is the amd64 leg of the same
+      # check run on macOS arm64 and Linux aarch64 (emulated amd64 cannot host
+      # it — qemu's tar returns ENOSYS on nested directories).
+      - name: Timezone parity, stock vs patched (native amd64, same tzdata)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.parity
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

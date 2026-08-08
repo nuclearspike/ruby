@@ -1,0 +1,30 @@
+# CI-only image: builds STOCK and PATCHED Ruby 3.3.10 from the same source tree,
+# in the same base image, against the same tzdata and libc — so a timezone
+# differential isolates the interpreter change as the single variable.
+# (Comparing our image against the official ruby:3.3.10 image does NOT: those
+# ship tzdata 2026b and 2026a respectively, which alone changes America/Vancouver.)
+FROM heroku/heroku:26-build
+USER root
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && apt-get install -y -qq autoconf rustc ruby git \
+      libssl-dev libyaml-dev zlib1g-dev libgmp-dev libffi-dev libreadline-dev tzdata \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone -q https://github.com/nuclearspike/ruby.git /src
+WORKDIR /src
+# PATCHED = the published tag; STOCK = its parent, i.e. pristine v3_3_10.
+RUN git checkout -q v3_3_10-timelocal.1~1 && ./autogen.sh \
+    && mkdir -p /b-stock && cd /b-stock \
+    && /src/configure --prefix=/opt/stock --disable-install-doc >/dev/null \
+    && make -j"$(nproc)" >/dev/null && make install >/dev/null
+RUN git checkout -q v3_3_10-timelocal.1 && ./autogen.sh \
+    && mkdir -p /b-patched && cd /b-patched \
+    && /src/configure --prefix=/opt/patched --disable-install-doc >/dev/null \
+    && make -j"$(nproc)" >/dev/null && make install >/dev/null
+COPY parity_all_zones.rb /parity_all_zones.rb
+RUN dpkg-query -W -f='tzdata=${Version}\n' tzdata \
+    && /opt/stock/bin/ruby   --disable-gems /parity_all_zones.rb > /stock.txt \
+    && /opt/patched/bin/ruby --disable-gems /parity_all_zones.rb > /patched.txt \
+    && echo "zones compared: $(wc -l < /stock.txt)" \
+    && if diff -q /stock.txt /patched.txt >/dev/null; then \
+         echo 'PARITY OK - all zones byte-identical (x86_64-linux, tzdata held constant)'; \
+       else echo 'PARITY FAILURE:'; diff /stock.txt /patched.txt | head -40; exit 1; fi
